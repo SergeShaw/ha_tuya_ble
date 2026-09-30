@@ -21,6 +21,7 @@ from .tuya_ble.const import TuyaBLECode
 
 _LOGGER = logging.getLogger(__name__)
 LAMOMO_PRODUCT_ID = "0qgrjxum"
+RECONNECT_DELAY = 15
 WRITE = "00000001-0000-1001-8001-00805f9b07d0"
 NOTIFY = "00000002-0000-1001-8001-00805f9b07d0"
 
@@ -115,6 +116,40 @@ class LamomoFD50Device(TuyaBLEDevice):
         self._report_versions = {}
         self._report_event = asyncio.Event()
         self._reconnect_task = None
+        self._local_update_callbacks = []
+
+    async def start(self):
+        """Own initial connection attempts as well as later reconnects."""
+        self._schedule_reconnect()
+
+    def _schedule_reconnect(self):
+        if not self._expected_disconnect and (
+            not self._reconnect_task or self._reconnect_task.done()
+        ):
+            self._reconnect_task = self._create_task(self._reconnect())
+
+    def register_local_update_callback(self, callback):
+        """Register cached-state notifications, not connectivity evidence."""
+        self._local_update_callbacks.append(callback)
+
+        def unregister():
+            self._local_update_callbacks.remove(callback)
+
+        return unregister
+
+    def _fire_local_update_callbacks(self, datapoints):
+        if not self._expected_disconnect:
+            for callback in self._local_update_callbacks:
+                callback(datapoints)
+
+    def _check_live_connection(self):
+        if (
+            self._expected_disconnect
+            or not self._client
+            or not self._client.is_connected
+            or not self._is_paired
+        ):
+            raise ConnectionError("Lamomo disconnected before state confirmation")
 
     def _decode_advertisement_data(self):
         # FD50's advertisement differs from the stock A201 manufacturer layout.
@@ -274,6 +309,9 @@ class LamomoFD50Device(TuyaBLEDevice):
         deadline = asyncio.get_running_loop().time() + 8
         while True:
             self._report_event.clear()
+            # Reports can arrive immediately before a disconnect callback.
+            # Cached matching reports alone cannot finish a reconnect.
+            self._check_live_connection()
             if all(
                 self._report_versions.get(dp_id, 0) > baseline.get(dp_id, 0)
                 and (
@@ -283,25 +321,25 @@ class LamomoFD50Device(TuyaBLEDevice):
                 for dp_id, raw in expected.items()
             ):
                 return
-            if (
-                self._expected_disconnect
-                or not self._client
-                or not self._client.is_connected
-            ):
-                raise ConnectionError("Lamomo disconnected before state confirmation")
             await asyncio.wait_for(
                 self._report_event.wait(),
                 max(0, deadline - asyncio.get_running_loop().time()),
             )
 
     async def update(self):
-        async with self._write_lock:
-            await self._ensure_connected()
-            baseline = self._report_versions.copy()
-            await self._send_packet_while_connected(
-                TuyaBLECode.FUN_SENDER_DEVICE_STATUS, b"", 0, True
-            )
-            await self._wait_reported({1: None, 2: None, 5: None}, baseline)
+        try:
+            async with self._write_lock:
+                await self._ensure_connected()
+                baseline = self._report_versions.copy()
+                await self._send_packet_while_connected(
+                    TuyaBLECode.FUN_SENDER_DEVICE_STATUS, b"", 0, True
+                )
+                await self._wait_reported({1: None, 2: None, 5: None}, baseline)
+        except Exception:
+            # Setup is asynchronous; a transient first failure still needs a
+            # tracked retry owner. An existing retry task is never duplicated.
+            self._schedule_reconnect()
+            raise
 
     async def _send_datapoints(self, datapoint_ids):
         # Stock entities schedule power, mode and color as separate tasks.
@@ -315,10 +353,10 @@ class LamomoFD50Device(TuyaBLEDevice):
             for dp_id in datapoint_ids
         }
         async with self._write_lock:
-            await self._ensure_connected()
-            baseline = self._report_versions.copy()
             expected = {dp_id: raw for dp_id, (_, raw) in desired.items()}
             try:
+                await self._ensure_connected()
+                baseline = self._report_versions.copy()
                 for dp_id, raw in expected.items():
                     self._dp_counter = (self._dp_counter + 1) & 255
                     payload = encode_write(
@@ -331,7 +369,8 @@ class LamomoFD50Device(TuyaBLEDevice):
                     TuyaBLECode.FUN_SENDER_DEVICE_STATUS, b"", 0, True
                 )
                 await self._wait_reported(expected, baseline)
-            except BaseException:
+            except BaseException as error:
+                restored = []
                 for dp_id in expected:
                     raw = self._reported.get(dp_id)
                     if raw is not None:
@@ -345,7 +384,11 @@ class LamomoFD50Device(TuyaBLEDevice):
                         parsed = decode_status(report)
                         if parsed:
                             dp._update_from_device(time.time(), 0, parsed[1], parsed[2])
-                            self._fire_callbacks([dp])
+                            restored.append(dp)
+                if restored:
+                    self._fire_local_update_callbacks(restored)
+                if isinstance(error, Exception):
+                    self._schedule_reconnect()
                 raise
 
     def _reset_transport(self):
@@ -367,33 +410,42 @@ class LamomoFD50Device(TuyaBLEDevice):
         self._is_paired = False
         self._reset_transport()
         self._fire_disconnected_callbacks()
-        if (
-            was_paired
-            and not self._expected_disconnect
-            and (not self._reconnect_task or self._reconnect_task.done())
-        ):
-            self._reconnect_task = self._create_task(self._reconnect())
+        if was_paired:
+            self._schedule_reconnect()
 
     async def _execute_disconnect(self):
         self._expected_disconnect = True
-        async with self._connect_lock:
-            client, self._client = self._client, None
-            self._is_paired = False
-            try:
-                if client and client.is_connected:
-                    await asyncio.wait_for(client.disconnect(), 5)
-            finally:
-                self._reset_transport()
-                for task in list(self._background_tasks):
-                    if task is not asyncio.current_task():
-                        task.cancel()
+        tasks = [
+            task
+            for task in self._background_tasks
+            if task is not asyncio.current_task()
+        ]
+        # Cancel an in-flight retry before waiting for its connection lock.
+        # Otherwise unload could wait through the entire connect timeout.
+        for task in tasks:
+            task.cancel()
+        try:
+            async with self._connect_lock:
+                client, self._client = self._client, None
+                self._is_paired = False
+                try:
+                    if client and client.is_connected:
+                        await asyncio.wait_for(client.disconnect(), 5)
+                finally:
+                    self._reset_transport()
+        finally:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._background_tasks.difference_update(tasks)
 
     async def _reconnect(self):
         while not self._expected_disconnect:
             try:
                 await self.update()
+                self._check_live_connection()
             except Exception:
-                _LOGGER.warning("Lamomo BLE reconnect failed; retrying in 15 seconds")
-                await asyncio.sleep(15)
+                if self._expected_disconnect:
+                    return
+                _LOGGER.warning("Lamomo BLE reconnect failed; retrying")
+                await asyncio.sleep(RECONNECT_DELAY)
             else:
                 return

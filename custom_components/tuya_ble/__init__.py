@@ -16,6 +16,7 @@ from .cloud import HASSTuyaBLEDeviceManager
 from .const import DOMAIN
 from .device_factory import async_create_device
 from .devices import TuyaBLECoordinator, TuyaBLEData, get_device_product_info
+from .lamomo_fd50 import LamomoFD50Device
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -60,7 +61,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             f"Could not communicate with Tuya BLE device with address {address}"
         ) from ex
     """
-    hass.add_job(device.update())
+    if isinstance(device, LamomoFD50Device):
+        await device.start()
+    else:
+        hass.add_job(device.update())
 
     @callback
     def _async_update_ble(

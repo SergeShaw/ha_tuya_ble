@@ -381,6 +381,7 @@ class FreshReadbackTests(unittest.IsolatedAsyncioTestCase):
     def prepare(self):
         device = adapter.LamomoFD50Device()
         device._client = SimpleNamespace(is_connected=True)
+        device._is_paired = True
         device._reported = {1: b"\x00"}
         device._report_versions = {1: 3}
         device._report_event = asyncio.Event()

@@ -46,6 +46,7 @@ def _integration():
             self._device_info = None
             self.initialize_calls = 0
             self.stop = AsyncMock()
+            self.start = AsyncMock()
             device_instances.append(self)
 
         async def initialize(self):
@@ -205,6 +206,8 @@ class IntegrationSetupTests(unittest.IsolatedAsyncioTestCase):
             device = hass.data["tuya_ble"][entry.entry_id].device
             self.assertIsInstance(device, context.lamomo)
             self.assertEqual(device.initialize_calls, 1)
+            device.start.assert_awaited_once()
+            self.assertEqual(hass.jobs, [])
             hass.config_entries.async_forward_entry_setups.assert_awaited_once()
 
     async def test_resolved_credentials_select_lamomo_without_product_option(self):
@@ -224,6 +227,8 @@ class IntegrationSetupTests(unittest.IsolatedAsyncioTestCase):
             device = hass.data["tuya_ble"][entry.entry_id].device
             self.assertIs(type(device), context.legacy)
             self.assertEqual(device.initialize_calls, 1)
+            device.start.assert_not_awaited()
+            self.assertEqual(len(hass.jobs), 1)
 
     async def test_unload_stops_only_created_controller(self):
         with _integration() as context:
