@@ -117,6 +117,8 @@ class LamomoFD50Device(TuyaBLEDevice):
         self._report_event = asyncio.Event()
         self._reconnect_task = None
         self._local_update_callbacks = []
+        self._notification_generation = 0
+        self._session_reports = set()
 
     async def start(self):
         """Own initial connection attempts as well as later reconnects."""
@@ -150,6 +152,36 @@ class LamomoFD50Device(TuyaBLEDevice):
             or not self._is_paired
         ):
             raise ConnectionError("Lamomo disconnected before state confirmation")
+
+    async def _run_owned_operation(self, operation):
+        # HA owns entity-control callers. Own the transport work separately so
+        # unload can cancel it without cancelling an unrelated caller task.
+        if self._expected_disconnect:
+            operation.close()
+            raise ConnectionError("Lamomo BLE is stopped")
+        task = self._create_task(operation)
+        try:
+            return await task
+        finally:
+            self._background_tasks.discard(task)
+
+    async def _discard_failed_connection(self, client):
+        if client is None:
+            return False
+        async with self._connect_lock:
+            # A delayed failure from an old ACK must not close a new session.
+            if self._client is not client:
+                return False
+            was_paired = self._is_paired
+            self._client = None
+            self._is_paired = False
+            self._reset_transport()
+            if was_paired and not self._expected_disconnect:
+                self._fire_disconnected_callbacks()
+            if client.is_connected:
+                with suppress(Exception):
+                    await asyncio.wait_for(client.disconnect(), 5)
+            return True
 
     def _decode_advertisement_data(self):
         # FD50's advertisement differs from the stock A201 manufacturer layout.
@@ -190,10 +222,21 @@ class LamomoFD50Device(TuyaBLEDevice):
                 self._is_paired = False
                 self._session_key = None
                 self._current_seq_num = 1
+                self._notification_generation += 1
+                generation = self._notification_generation
+
+                def notify(sender, data):
+                    if (
+                        not self._expected_disconnect
+                        and self._client is client
+                        and self._notification_generation == generation
+                    ):
+                        self._notification_handler(sender, data)
+
                 await asyncio.wait_for(
                     client.start_notify(
                         NOTIFY,
-                        self._notification_handler,
+                        notify,
                         bluez={"use_start_notify": True},
                     ),
                     8,
@@ -210,7 +253,7 @@ class LamomoFD50Device(TuyaBLEDevice):
                     TuyaBLECode.FUN_SENDER_PAIR, self._build_pairing_request(), 0, True
                 )
                 self._check_authenticated_protocol()
-                self._fire_connected_callbacks()
+                self._session_reports.clear()
             except BaseException:
                 self._is_paired = False
                 self._client = None
@@ -225,7 +268,7 @@ class LamomoFD50Device(TuyaBLEDevice):
             raise ValueError("Unexpected Lamomo authentication/protocol")
 
     async def _send_packet_while_connected(
-        self, code, data, response_to, wait_for_response
+        self, code, data, response_to, wait_for_response, *, expected_session=None
     ):
         # Serialize the complete send/wait cycle, not just individual ATT writes.
         async with self._operation_lock:
@@ -235,6 +278,13 @@ class LamomoFD50Device(TuyaBLEDevice):
                 or not self._client.is_connected
             ):
                 raise ConnectionError("Lamomo BLE is disconnected")
+            if expected_session is not None:
+                client, generation = expected_session
+                if (
+                    self._client is not client
+                    or self._notification_generation != generation
+                ):
+                    raise ConnectionError("Lamomo notification session expired")
             sequence = await self._get_seq_num()
             future = (
                 asyncio.get_running_loop().create_future()
@@ -286,24 +336,49 @@ class LamomoFD50Device(TuyaBLEDevice):
                 self._reported[dp_id] = data[11:].lower() if dp_id == 5 else data[11:]
                 self._report_versions[dp_id] = self._report_versions.get(dp_id, 0) + 1
                 self._report_event.set()
-                self._fire_callbacks([self._datapoints[dp_id]])
+                self._session_reports.add(dp_id)
+                # Pairing and partial state cannot make RGB controls usable.
+                # The light entity needs all three current-session datapoints.
+                if (
+                    {1, 2, 5} <= self._session_reports
+                    and self._is_paired
+                    and self._client
+                    and self._client.is_connected
+                ):
+                    self._fire_callbacks([self._datapoints[dp_id]])
             self._create_task(self._send_response(code, b"", sequence))
             return
         super()._handle_command_or_response(sequence, response_to, code, data)
 
-    async def _send_response(self, code, data, response_to):
+    def _send_response(self, code, data, response_to):
+        # Capture ownership at creation, not when a queued ACK starts running.
+        return self._send_session_response(
+            self._client, self._notification_generation, code, data, response_to
+        )
+
+    async def _send_session_response(self, client, generation, code, data, response_to):
         if (
             self._expected_disconnect
-            or not self._client
-            or not self._client.is_connected
+            or client is None
+            or self._client is not client
+            or self._notification_generation != generation
+            or not client.is_connected
         ):
             return
         try:
-            await self._send_packet_while_connected(code, data, response_to, False)
-        except ConnectionError, TimeoutError:
-            # A notification ACK queued before unload can lose its connection.
-            # It must not produce an unhandled background task exception.
-            _LOGGER.debug("Lamomo notification ACK skipped after disconnect")
+            await self._send_packet_while_connected(
+                code,
+                data,
+                response_to,
+                False,
+                expected_session=(client, generation),
+            )
+        except Exception:
+            # Bleak errors are not ConnectionError subclasses. Detached ACK
+            # tasks must handle transport failures and recover the failed link.
+            _LOGGER.debug("Lamomo notification ACK failed", exc_info=True)
+            if await self._discard_failed_connection(client):
+                self._schedule_reconnect()
 
     async def _wait_reported(self, expected, baseline):
         deadline = asyncio.get_running_loop().time() + 8
@@ -327,19 +402,26 @@ class LamomoFD50Device(TuyaBLEDevice):
             )
 
     async def update(self):
-        try:
-            async with self._write_lock:
+        await self._run_owned_operation(self._update())
+
+    async def _update(self):
+        async with self._write_lock:
+            client = None
+            try:
                 await self._ensure_connected()
+                client = self._client
                 baseline = self._report_versions.copy()
                 await self._send_packet_while_connected(
                     TuyaBLECode.FUN_SENDER_DEVICE_STATUS, b"", 0, True
                 )
                 await self._wait_reported({1: None, 2: None, 5: None}, baseline)
-        except Exception:
-            # Setup is asynchronous; a transient first failure still needs a
-            # tracked retry owner. An existing retry task is never duplicated.
-            self._schedule_reconnect()
-            raise
+                self._fire_connected_callbacks()
+            except Exception:
+                await self._discard_failed_connection(client)
+                # Setup is asynchronous; a transient first failure still needs
+                # a tracked retry owner. Existing retries are never duplicated.
+                self._schedule_reconnect()
+                raise
 
     async def _send_datapoints(self, datapoint_ids):
         # Stock entities schedule power, mode and color as separate tasks.
@@ -352,10 +434,15 @@ class LamomoFD50Device(TuyaBLEDevice):
             )
             for dp_id in datapoint_ids
         }
+        await self._run_owned_operation(self._send_desired_datapoints(desired))
+
+    async def _send_desired_datapoints(self, desired):
         async with self._write_lock:
             expected = {dp_id: raw for dp_id, (_, raw) in desired.items()}
+            client = None
             try:
                 await self._ensure_connected()
+                client = self._client
                 baseline = self._report_versions.copy()
                 for dp_id, raw in expected.items():
                     self._dp_counter = (self._dp_counter + 1) & 255
@@ -388,10 +475,13 @@ class LamomoFD50Device(TuyaBLEDevice):
                 if restored:
                     self._fire_local_update_callbacks(restored)
                 if isinstance(error, Exception):
+                    await self._discard_failed_connection(client)
                     self._schedule_reconnect()
                 raise
 
     def _reset_transport(self):
+        self._notification_generation += 1
+        self._session_reports.clear()
         self._session_key = None
         self._clean_input()
         for future in list(self._input_expected_responses.values()):
@@ -403,7 +493,7 @@ class LamomoFD50Device(TuyaBLEDevice):
         self._report_event.set()
 
     def _disconnected(self, client):
-        if self._client is not client and not self._expected_disconnect:
+        if self._client is not client:
             return
         was_paired = self._is_paired
         self._client = None

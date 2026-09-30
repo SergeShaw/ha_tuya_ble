@@ -51,11 +51,18 @@ class DeviceStub:
         self._ble_device = SimpleNamespace(address="TEST-ADDRESS")
         self._input_expected_responses = {}
         self._background_tasks = set()
+        self._notification_generation = 0
         self.function = {}
         self.status_range = {}
 
     async def initialize(self):
         pass
+
+    def _create_task(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     def append_functions(self, functions, status_range):
         self.function.update({item["code"]: item for item in functions})

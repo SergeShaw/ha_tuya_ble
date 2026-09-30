@@ -94,6 +94,13 @@ class _CoordinatorBoundary:
 def _actual_integration():
     """Import actual repository modules with isolated external dependency fakes."""
     connection_error = type("SyntheticBleakError", (Exception,), {})
+    establish = AsyncMock()
+
+    async def establish_connection(*args, **kwargs):
+        client = await establish(*args, **kwargs)
+        client.disconnected = args[3]
+        return client
+
     connector = _module(
         "bleak_retry_connector",
         BLEAK_BACKOFF_TIME=1,
@@ -101,7 +108,7 @@ def _actual_integration():
         BleakClientWithServiceCache=object,
         BleakError=connection_error,
         BleakNotFoundError=connection_error,
-        establish_connection=AsyncMock(),
+        establish_connection=establish_connection,
     )
 
     def async_call_later(hass, delay, callback):
@@ -164,7 +171,8 @@ def _actual_integration():
                 devices=devices,
                 transport=transport,
                 code=sys.modules[PACKAGE + ".tuya_ble.const"].TuyaBLECode,
-                establish=connector.establish_connection,
+                establish=establish,
+                bleak_error=connection_error,
             )
 
 
@@ -187,17 +195,24 @@ class _Manager:
 class _Client:
     """Synthetic BLE peripheral accepting and producing actual framed packets."""
 
-    def __init__(self, context, device, *, report_status=True):
+    def __init__(self, context, device, *, report_status=True, srand=b"abcdef"):
         self.context = context
         self.device = device
         self.is_connected = True
         self.report_status = report_status
         self.drop_on_control = False
+        self.write_error = None
+        self.write_error_codes = set()
+        self.hold_device_info = False
+        self.held_packets = []
+        self.srand = srand
         self.status_requests = 0
+        self.write_count = 0
         self.buffer = bytearray()
         self.expected_length = 0
         self.notification_sequence = 100
-        self.notify = device._notification_handler
+        self.notify = None
+        self.disconnected = None
         self.values = {
             1: (1, b"\x00"),
             2: (4, b"\x00"),
@@ -212,17 +227,29 @@ class _Client:
 
     def drop(self):
         self.is_connected = False
-        self.device._disconnected(self)
+        if self.disconnected:
+            self.disconnected(self)
 
-    def _notify(self, code, data, response_to=0):
+    def notification_packets(self, code, data, response_to=0):
         self.notification_sequence += 1
-        for packet in self.device._build_packets(
+        return self.device._build_packets(
             self.notification_sequence, code, data, response_to
-        ):
+        )
+
+    def emit_packets(self, packets):
+        for packet in packets:
             self.notify(0, packet)
 
-    def report(self):
-        for dp_id, (dtype, raw) in self.values.items():
+    def _notify(self, code, data, response_to=0):
+        packets = self.notification_packets(code, data, response_to)
+        if code == self.context.code.FUN_SENDER_DEVICE_INFO and self.hold_device_info:
+            self.held_packets.extend(packets)
+        else:
+            self.emit_packets(packets)
+
+    def report(self, dp_ids=(1, 2, 5)):
+        for dp_id in dp_ids:
+            dtype, raw = self.values[dp_id]
             data = (
                 bytes(4)
                 + bytes([1, 128, 0, dp_id, dtype])
@@ -232,6 +259,7 @@ class _Client:
             self._notify(self.context.code.FUN_RECEIVE_DP_V4, data)
 
     async def write_gatt_char(self, _uuid, packet, **_kwargs):
+        self.write_count += 1
         packet_num, position = self.device._unpack_int(packet, 0)
         if packet_num == 0:
             self.buffer.clear()
@@ -245,10 +273,14 @@ class _Client:
         sequence, _response_to, code_value, length = unpack(">IIHH", raw[:12])
         code = self.context.code(code_value)
         data = raw[12 : 12 + length]
+        if self.write_error and (
+            not self.write_error_codes or code in self.write_error_codes
+        ):
+            raise self.write_error
         if code == self.context.code.FUN_SENDER_DEVICE_INFO:
             info = bytearray(46)
             info[:6] = bytes([1, 1, 4, 4, 0, 1])
-            info[6:12] = b"abcdef"
+            info[6:12] = self.srand
             self._notify(code, bytes(info), sequence)
         elif code == self.context.code.FUN_SENDER_PAIR:
             self._notify(code, b"\x00", sequence)
@@ -479,6 +511,203 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 hass.timers[1].fire()
                 self.assertFalse(coordinator.connected)
             finally:
+                await self.cleanup(device)
+
+    async def test_failed_connected_session_is_replaced_before_retry(self):
+        for error_kind in ("bleak", "connection"):
+            with self.subTest(error_kind=error_kind), _actual_integration() as context:
+                device, _coordinator, _hass, original = await self.connected(context)
+                await self.settle()
+                recovered = _Client(context, device, srand=b"uvwxyz")
+                context.establish.return_value = recovered
+                error_type = (
+                    context.bleak_error if error_kind == "bleak" else ConnectionError
+                )
+                original.write_error = error_type(
+                    "GATT session failed but link flag stayed true"
+                )
+                try:
+                    with self.assertRaises(error_type):
+                        await device.datapoints[1].set_value(True)
+                    await self.eventually(
+                        lambda device=device, recovered=recovered: (
+                            device._client is recovered and device._is_paired
+                        )
+                    )
+                    self.assertFalse(original.is_connected)
+                    self.assertGreaterEqual(context.establish.await_count, 2)
+                    await device.datapoints[1].set_value(True)
+                    self.assertTrue(device.datapoints[1].value)
+                finally:
+                    await self.cleanup(device)
+
+    async def test_bleak_notification_ack_error_is_handled_and_recovers(self):
+        with _actual_integration() as context:
+            device, _coordinator, _hass, original = await self.connected(context)
+            await self.settle()
+            recovered = _Client(context, device, srand=b"uvwxyz")
+            context.establish.return_value = recovered
+            original.write_error = context.bleak_error(
+                "Synthetic notification ACK failure"
+            )
+            original.write_error_codes = {context.code.FUN_RECEIVE_DP_V4}
+            unhandled = []
+            loop = asyncio.get_running_loop()
+            previous_handler = loop.get_exception_handler()
+            loop.set_exception_handler(lambda _loop, error: unhandled.append(error))
+            try:
+                original.report((1,))
+                await self.settle()
+                self.assertEqual(unhandled, [])
+                await self.eventually(
+                    lambda: device._client is recovered and device._is_paired
+                )
+                self.assertFalse(original.is_connected)
+                self.assertIsNotNone(device._reconnect_task)
+            finally:
+                await self.cleanup(device)
+                loop.set_exception_handler(previous_handler)
+
+    async def test_stop_cancels_external_control_inner_connection(self):
+        with _actual_integration() as context:
+            device, _coordinator, _hass, original = await self.connected(context)
+            await self.settle()
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            recovered = _Client(context, device)
+            attempts = 0
+
+            async def connection(*_args, **_kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise ConnectionError("Initial retry failed")
+                entered.set()
+                await release.wait()
+                return recovered
+
+            context.establish.side_effect = connection
+            control = None
+            with patch.object(context.adapter, "RECONNECT_DELAY", 10):
+                original.drop()
+                try:
+                    await self.eventually(lambda: attempts == 1)
+                    await self.settle()
+                    # HA owns this outer service task; its inner BLE work must
+                    # still be cancellable by the device during entry unload.
+                    control = asyncio.create_task(device.datapoints[1].set_value(True))
+                    await asyncio.wait_for(entered.wait(), 1)
+                    self.assertTrue(device._connect_lock.locked())
+                    await asyncio.wait_for(device.stop(), 0.3)
+                    release.set()
+                    await self.settle()
+                    self.assertTrue(control.done())
+                    self.assertIsNone(device._client)
+                    self.assertFalse(device._connect_lock.locked())
+                    calls_at_stop = context.establish.await_count
+                    await asyncio.sleep(0.02)
+                    self.assertEqual(context.establish.await_count, calls_at_stop)
+                finally:
+                    release.set()
+                    if control is not None:
+                        control.cancel()
+                        await asyncio.gather(control, return_exceptions=True)
+                    await self.cleanup(device)
+
+    async def test_initial_pair_and_partial_reports_remain_unavailable(self):
+        with _actual_integration() as context:
+            device, coordinator, _hass = await self.device(context)
+            client = _Client(context, device, report_status=False)
+            context.establish.return_value = client
+            update = asyncio.create_task(device.update())
+            try:
+                await self.eventually(lambda: client.status_requests == 1)
+                await self.settle()
+                self.assertTrue(device._is_paired)
+                readiness = [coordinator.connected]
+                for dp_id in (1, 2, 5):
+                    client.report((dp_id,))
+                    await self.settle()
+                    readiness.append(coordinator.connected)
+                await asyncio.wait_for(update, 1)
+                self.assertEqual(readiness, [False, False, False, True])
+            finally:
+                update.cancel()
+                await asyncio.gather(update, return_exceptions=True)
+                await self.cleanup(device)
+
+    async def test_old_device_info_callback_cannot_replace_new_session(self):
+        with _actual_integration() as context:
+            device, _coordinator, _hass = await self.device(context)
+            original = _Client(context, device, srand=b"abcdef")
+            original.hold_device_info = True
+            recovered = _Client(context, device, srand=b"uvwxyz")
+            context.establish.side_effect = [original, recovered]
+            update = asyncio.create_task(device.update())
+            try:
+                await self.eventually(lambda: bool(original.held_packets))
+                original.drop()
+                with self.assertRaises(ConnectionError):
+                    await update
+                await self.eventually(
+                    lambda: device._client is recovered and device._is_paired
+                )
+                await self.settle()
+                session = device._session_key
+                original.emit_packets(original.held_packets)
+                self.assertIs(device._client, recovered)
+                self.assertEqual(device._session_key, session)
+            finally:
+                update.cancel()
+                await asyncio.gather(update, return_exceptions=True)
+                await self.cleanup(device)
+
+    async def test_retained_notification_callback_is_inert_after_stop(self):
+        with _actual_integration() as context:
+            device, coordinator, _hass, client = await self.connected(context)
+            await self.settle()
+            info = bytearray(46)
+            info[:6] = bytes([1, 1, 4, 4, 0, 1])
+            info[6:12] = b"abcdef"
+            late_info = client.notification_packets(
+                context.code.FUN_SENDER_DEVICE_INFO, bytes(info), 1
+            )
+            late_power = client.notification_packets(
+                context.code.FUN_RECEIVE_DP_V4,
+                bytes(4) + bytes([1, 128, 0, 1, 1, 0, 1, 1]),
+            )
+            try:
+                await device.stop()
+                reports = device._report_versions.copy()
+                updates = coordinator.listener_updates
+                client.emit_packets(late_info)
+                client.emit_packets(late_power)
+                self.assertIsNone(device._session_key)
+                self.assertEqual(device._report_versions, reports)
+                self.assertFalse(device.datapoints[1].value)
+                self.assertEqual(coordinator.listener_updates, updates)
+                self.assertFalse(device._background_tasks)
+            finally:
+                await self.cleanup(device)
+
+    async def test_queued_old_session_ack_does_not_write_to_new_client(self):
+        with _actual_integration() as context:
+            device, _coordinator, _hass, original = await self.connected(context)
+            await self.settle()
+            recovered = _Client(context, device, srand=b"uvwxyz")
+            context.establish.return_value = recovered
+            queued_ack = device._send_response(context.code.FUN_RECEIVE_DP_V4, b"", 777)
+            try:
+                original.drop()
+                await self.eventually(
+                    lambda: device._client is recovered and device._is_paired
+                )
+                await self.settle()
+                writes_before = recovered.write_count
+                await queued_ack
+                self.assertEqual(recovered.write_count, writes_before)
+            finally:
+                queued_ack.close()
                 await self.cleanup(device)
 
 
