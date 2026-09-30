@@ -213,6 +213,10 @@ class _Client:
         self.notification_sequence = 100
         self.notify = None
         self.disconnected = None
+        self.disconnect_calls = 0
+        self.block_first_disconnect = False
+        self.disconnect_entered = asyncio.Event()
+        self.disconnect_cancelled = False
         self.values = {
             1: (1, b"\x00"),
             2: (4, b"\x00"),
@@ -223,6 +227,14 @@ class _Client:
         self.notify = callback
 
     async def disconnect(self):
+        self.disconnect_calls += 1
+        if self.block_first_disconnect and self.disconnect_calls == 1:
+            self.disconnect_entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.disconnect_cancelled = True
+                raise
         self.drop()
 
     def drop(self):
@@ -709,6 +721,59 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 queued_ack.close()
                 await self.cleanup(device)
+
+    async def test_stop_closes_client_whose_control_error_cleanup_was_cancelled(self):
+        with _actual_integration() as context:
+            device, _coordinator, _hass, original = await self.connected(context)
+            await self.settle()
+            original.write_error = context.bleak_error("Control GATT write failed")
+            original.write_error_codes = {context.code.FUN_SENDER_DPS_V4}
+            original.block_first_disconnect = True
+            control = asyncio.create_task(device.datapoints[1].set_value(True))
+            try:
+                await asyncio.wait_for(original.disconnect_entered.wait(), 1)
+                await asyncio.wait_for(device.stop(), 0.3)
+                await self.settle()
+                self.assertTrue(original.disconnect_cancelled)
+                self.assertFalse(original.is_connected)
+                self.assertGreaterEqual(original.disconnect_calls, 2)
+                self.assertTrue(control.done())
+                self.assertTrue(all(task.done() for task in device._background_tasks))
+                self.assertIsNone(device._client)
+                self.assertFalse(device._connect_lock.locked())
+            finally:
+                control.cancel()
+                await asyncio.gather(control, return_exceptions=True)
+                await self.cleanup(device)
+                if original.is_connected:
+                    await original.disconnect()
+
+    async def test_stop_closes_client_whose_auth_error_cleanup_was_cancelled(self):
+        with _actual_integration() as context:
+            device, _coordinator, _hass = await self.device(context)
+            original = _Client(context, device)
+            original.write_error = context.bleak_error("Device info GATT write failed")
+            original.write_error_codes = {context.code.FUN_SENDER_DEVICE_INFO}
+            original.block_first_disconnect = True
+            context.establish.return_value = original
+            update = asyncio.create_task(device.update())
+            try:
+                await asyncio.wait_for(original.disconnect_entered.wait(), 1)
+                await asyncio.wait_for(device.stop(), 0.3)
+                await self.settle()
+                self.assertTrue(original.disconnect_cancelled)
+                self.assertFalse(original.is_connected)
+                self.assertGreaterEqual(original.disconnect_calls, 2)
+                self.assertTrue(update.done())
+                self.assertTrue(all(task.done() for task in device._background_tasks))
+                self.assertIsNone(device._client)
+                self.assertFalse(device._connect_lock.locked())
+            finally:
+                update.cancel()
+                await asyncio.gather(update, return_exceptions=True)
+                await self.cleanup(device)
+                if original.is_connected:
+                    await original.disconnect()
 
 
 if __name__ == "__main__":

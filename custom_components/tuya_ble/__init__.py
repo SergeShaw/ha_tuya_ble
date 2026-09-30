@@ -61,9 +61,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             f"Could not communicate with Tuya BLE device with address {address}"
         ) from ex
     """
-    if isinstance(device, LamomoFD50Device):
-        await device.start()
-    else:
+    if not isinstance(device, LamomoFD50Device):
         hass.add_job(device.update())
 
     @callback
@@ -93,7 +91,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         coordinator,
     )
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    try:
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except BaseException:
+        if isinstance(device, LamomoFD50Device):
+            try:
+                await device.stop()
+            finally:
+                hass.data[DOMAIN].pop(entry.entry_id, None)
+        raise
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
     async def _async_stop(_event: Event) -> None:
@@ -103,6 +109,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.async_on_unload(
         hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_stop)
     )
+    if isinstance(device, LamomoFD50Device):
+        # Persistent connection work begins only after platform setup succeeds
+        # and the HA-stop callback has been registered.
+        await device.start()
     return True
 
 

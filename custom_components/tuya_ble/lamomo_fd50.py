@@ -119,6 +119,7 @@ class LamomoFD50Device(TuyaBLEDevice):
         self._local_update_callbacks = []
         self._notification_generation = 0
         self._session_reports = set()
+        self._retiring_clients = set()
 
     async def start(self):
         """Own initial connection attempts as well as later reconnects."""
@@ -173,15 +174,28 @@ class LamomoFD50Device(TuyaBLEDevice):
             if self._client is not client:
                 return False
             was_paired = self._is_paired
+            self._retiring_clients.add(client)
             self._client = None
             self._is_paired = False
             self._reset_transport()
             if was_paired and not self._expected_disconnect:
                 self._fire_disconnected_callbacks()
-            if client.is_connected:
-                with suppress(Exception):
-                    await asyncio.wait_for(client.disconnect(), 5)
+            with suppress(Exception):
+                await self._disconnect_client(client)
             return True
+
+    async def _disconnect_client(self, client):
+        # Cancellation or a timeout must not lose a still-connected client.
+        # Stop/retry retain ownership until another bounded close succeeds.
+        self._retiring_clients.add(client)
+        try:
+            if client.is_connected:
+                await asyncio.wait_for(client.disconnect(), 5)
+            if client.is_connected:
+                raise ConnectionError("Lamomo previous connection did not close")
+        finally:
+            if not client.is_connected:
+                self._retiring_clients.discard(client)
 
     def _decode_advertisement_data(self):
         # FD50's advertisement differs from the stock A201 manufacturer layout.
@@ -207,6 +221,8 @@ class LamomoFD50Device(TuyaBLEDevice):
                 return
             client = None
             try:
+                for retiring in list(self._retiring_clients):
+                    await self._disconnect_client(retiring)
                 client = await asyncio.wait_for(
                     establish_connection(
                         BleakClientWithServiceCache,
@@ -255,12 +271,14 @@ class LamomoFD50Device(TuyaBLEDevice):
                 self._check_authenticated_protocol()
                 self._session_reports.clear()
             except BaseException:
+                if client is not None:
+                    self._retiring_clients.add(client)
                 self._is_paired = False
                 self._client = None
-                if client and client.is_connected:
-                    with suppress(Exception):
-                        await asyncio.wait_for(client.disconnect(), 5)
                 self._reset_transport()
+                if client is not None:
+                    with suppress(Exception):
+                        await self._disconnect_client(client)
                 raise
 
     def _check_authenticated_protocol(self):
@@ -515,17 +533,21 @@ class LamomoFD50Device(TuyaBLEDevice):
         for task in tasks:
             task.cancel()
         try:
-            async with self._connect_lock:
-                client, self._client = self._client, None
-                self._is_paired = False
-                try:
-                    if client and client.is_connected:
-                        await asyncio.wait_for(client.disconnect(), 5)
-                finally:
-                    self._reset_transport()
-        finally:
             await asyncio.gather(*tasks, return_exceptions=True)
-            self._background_tasks.difference_update(tasks)
+        finally:
+            self._background_tasks.difference_update(
+                task for task in tasks if task.done()
+            )
+        async with self._connect_lock:
+            if self._client is not None:
+                self._retiring_clients.add(self._client)
+            self._client = None
+            self._is_paired = False
+            try:
+                for client in list(self._retiring_clients):
+                    await self._disconnect_client(client)
+            finally:
+                self._reset_transport()
 
     async def _reconnect(self):
         while not self._expected_disconnect:

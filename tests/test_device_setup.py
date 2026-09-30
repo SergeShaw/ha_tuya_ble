@@ -4,6 +4,7 @@ These tests use the actual integration setup/factory source, not a live HA
 process. Credentials and addresses are synthetic; no network calls occur.
 """
 
+import asyncio
 import importlib.util
 import sys
 import unittest
@@ -198,6 +199,53 @@ def _hass(product_id):
 
 
 class IntegrationSetupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_lamomo_platform_setup_stops_without_start_or_retained_data(
+        self,
+    ):
+        for error_type in (RuntimeError, asyncio.CancelledError):
+            with self.subTest(error_type=error_type), _integration() as context:
+                entry = _entry({"product_id": "0qgrjxum"})
+                hass = _hass("0qgrjxum")
+                hass.config_entries.async_forward_entry_setups.side_effect = error_type(
+                    "Synthetic platform setup failure"
+                )
+                with self.assertRaises(error_type):
+                    await context.integration.async_setup_entry(hass, entry)
+                device = context.devices[-1]
+                self.assertEqual(
+                    (
+                        device.start.await_count,
+                        device.stop.await_count,
+                        entry.entry_id in hass.data.get("tuya_ble", {}),
+                    ),
+                    (0, 1, False),
+                )
+                self.assertEqual(hass.jobs, [])
+
+    async def test_lamomo_start_follows_platform_setup_and_stop_hook_registration(self):
+        with _integration() as context:
+            entry = _entry({"product_id": "0qgrjxum"})
+            hass = _hass("0qgrjxum")
+            forwarded = False
+
+            async def forward(_entry, _platforms):
+                nonlocal forwarded
+                device = context.devices[-1]
+                device.start.assert_not_awaited()
+
+                async def start():
+                    self.assertTrue(forwarded)
+                    hass.bus.async_listen_once.assert_called_once()
+
+                device.start.side_effect = start
+                forwarded = True
+
+            hass.config_entries.async_forward_entry_setups.side_effect = forward
+            self.assertTrue(await context.integration.async_setup_entry(hass, entry))
+            device = hass.data["tuya_ble"][entry.entry_id].device
+            device.start.assert_awaited_once()
+            device.stop.assert_not_awaited()
+
     async def test_manual_lamomo_uses_product_adapter(self):
         with _integration() as context:
             entry = _entry({"product_id": "0qgrjxum"})
