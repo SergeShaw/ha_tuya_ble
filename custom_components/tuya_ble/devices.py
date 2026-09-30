@@ -479,6 +479,10 @@ devices_database: dict[str, TuyaBLECategoryInfo] = {
     ),
     "dd": TuyaBLECategoryInfo(
         products={
+            "0qgrjxum": TuyaBLEProductInfo(
+                name="RGB Neon Strip Light",
+                manufacturer="Lamomo",
+            ),
             **dict.fromkeys(
                 [
                     "nvfrtxlq",

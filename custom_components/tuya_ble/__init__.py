@@ -14,8 +14,8 @@ from homeassistant.exceptions import ConfigEntryNotReady
 
 from .cloud import HASSTuyaBLEDeviceManager
 from .const import DOMAIN
+from .device_factory import async_create_device
 from .devices import TuyaBLECoordinator, TuyaBLEData, get_device_product_info
-from .tuya_ble import TuyaBLEDevice
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -47,8 +47,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         msg = f"Could not find Tuya BLE device with address {address}"
         raise ConfigEntryNotReady(msg)
     manager = HASSTuyaBLEDeviceManager(hass, entry.options.copy())
-    device = TuyaBLEDevice(manager, ble_device)
-    await device.initialize()
+    device = await async_create_device(manager, ble_device)
     product_info = get_device_product_info(device)
 
     coordinator = TuyaBLECoordinator(hass, device)
